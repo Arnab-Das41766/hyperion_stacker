@@ -1,0 +1,73 @@
+# =============================================================================
+# Hyperion Stacker - Git Ignore Configuration
+# =============================================================================
+
+# 1. Input drop folder, processing staging, and generated outputs
+# (Preserve folder structure with .gitkeep)
+input/*
+!input/.gitkeep
+
+processing/*
+!processing/.gitkeep
+
+output/*
+!output/.gitkeep
+
+# 2. Large hyperspectral rasters, sidecars, and pyramids (>100MB)
+*.img
+*.rrd
+*.ige
+*.ovr
+*.aux
+*.aux.xml
+*.TIF
+*.tif
+*.tiff
+*.hdr
+*.hdf
+*.h5
+*.nc
+*.dem
+*.vat.dbf
+
+# 3. Compressed archives (USGS downloads & raw archives)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.rar
+*.7z
+
+# 4. ESRI ArcGIS Pro / ArcMap projects, geodatabases, and locks
+*.gdb/
+*.gdb
+*.aprx
+*.mapx
+*.lyrx
+*.tbx
+*.lock
+New Folder/
+
+# 5. Temporary extraction and test sandboxes
+_temp_extract/
+_test_sandbox/
+*.tmp
+*.temp
+
+# 6. Python bytecode, virtual environments, and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+venv/
+ENV/
+.pytest_cache/
+
+# 7. Operating system and IDE metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
