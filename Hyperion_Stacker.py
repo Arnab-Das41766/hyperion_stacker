@@ -609,296 +609,35 @@ def validate_bands(band_files, target_bands):
 
 
 # =============================================================================
-# STACKING ENGINE & ERDAS IMAGINE (.IMG) GENERATION
+# ARCGIS PRO OPTIMIZED BIGTIFF STACKING ENGINE (.TIF)
 # =============================================================================
 
 def create_stack(band_files, output_file, ref_info, target_bands, mtl_info=None, scale_to_8bit=False):
     """
-    Creates an ERDAS Imagine HFA format (.img) hyperspectral stacked raster.
+    Creates an ArcGIS Pro / ArcMap optimized multi-band BigTIFF (.tif) raster stack.
+    Preserves full 16-bit radiometric fidelity, VNIR/SWIR scale factors, and generates
+    ArcGIS-compatible band metadata, PAM statistics, and multi-threaded overview pyramids.
+
     Features:
-      - Driver: HFA (ERDAS Imagine)
-      - Full 16-bit radiometric fidelity preserved (Int16 / UInt16)
-      - Computes and embeds ERDAS-compliant statistics & histograms for each band
-      - Sets STATISTICS_EXCLUDEDVALUES="0" and LAYER_TYPE="athematic"
-      - Embeds VNIR (40.0) and SWIR (80.0) radiometric scale factors, wavelengths, FWHM
-      - Builds internal overviews [2, 4, 8, 16, 32, 64] with average resampling
+      - Driver: GTiff with BIGTIFF=IF_SAFER
+      - Lossless LZW compression with Predictor=2 (reduces disk footprint by 60-70% with 0% data loss)
+      - Internal 256x256 tile blocks for instant GPU-accelerated panning & zooming in ArcGIS Pro
+      - Sets human-readable band descriptions (e.g. 'B029 (640.5nm)') visible in ArcGIS Pro
+      - Embeds ESRI PAM metadata (.aux.xml) with full statistics & histograms
+      - Builds internal overviews [2, 4, 8, 16, 32] using multi-threaded CPU acceleration
     """
     num_bands = len(target_bands)
     print(f"============================================================")
-    print(f"   CREATING ERDAS IMAGINE HYPERSPECTRAL STACK ({num_bands} BANDS)  ")
+    print(f"   CREATING ARCGIS HYPERSPECTRAL STACK ({num_bands} BANDS)  ")
     print(f"============================================================\n")
     print(f"Output File: {output_file}")
+    print(f"Format     : Cloud-Optimized BigTIFF (.tif) with Lossless LZW Compression")
     print(f"Bit Depth  : {'8-bit Scaled' if scale_to_8bit else '16-bit Preserved Radiometric Data'}\n")
 
     out_dtype = "uint8" if scale_to_8bit else ref_info["datatype"]
     nodata_val = 0 if not scale_to_8bit else None
 
     # Retrieve scale factors from MTL metadata if available
-    vnir_scale = mtl_info.get("SCALING_FACTOR_VNIR", 40.0) if mtl_info else 40.0
-    swir_scale = mtl_info.get("SCALING_FACTOR_SWIR", 80.0) if mtl_info else 80.0
-
-    if USE_RASTERIO:
-        profile = {
-            "driver": "HFA",
-            "count": num_bands,
-            "width": ref_info["width"],
-            "height": ref_info["height"],
-            "dtype": out_dtype,
-            "crs": ref_info["crs"],
-            "transform": ref_info["transform"],
-            "nodata": nodata_val
-        }
-
-        with rasterio.open(output_file, "w", **profile) as dst:
-            for out_idx, b_num in enumerate(target_bands, start=1):
-                info = HYPERION_BAND_INFO.get(b_num, {
-                    "wavelength_nm": 0.0,
-                    "fwhm_nm": 10.0,
-                    "spectrometer": "VNIR" if b_num <= 70 else "SWIR",
-                    "scale_factor": vnir_scale if b_num <= 70 else swir_scale,
-                    "is_calibrated": True
-                })
-
-                with rasterio.open(band_files[b_num]) as src:
-                    data = src.read(1)
-
-                if scale_to_8bit:
-                    valid_mask = data > 0
-                    if np.any(valid_mask):
-                        p2, p98 = np.percentile(data[valid_mask], [2, 98])
-                        scaled = np.clip((data.astype(np.float32) - p2) / max(p98 - p2, 1.0), 0.0, 1.0) * 254.0 + 1.0
-                        scaled[~valid_mask] = 0
-                        out_data = scaled.astype(np.uint8)
-                    else:
-                        out_data = np.zeros_like(data, dtype=np.uint8)
-                else:
-                    out_data = data
-
-                dst.write(out_data, out_idx)
-
-                # Compute statistics & histograms
-                valid = out_data[out_data > 0]
-                if np.any(valid):
-                    b_min = int(np.min(valid))
-                    b_max = int(np.max(valid))
-                    b_mean = float(np.mean(valid))
-                    b_std = float(np.std(valid))
-                    b_median = int(np.median(valid))
-
-                    # Safe histogram computation for 16-bit integer ranges
-                    span = b_max - b_min
-                    if 0 <= span <= 65536 and b_min >= 0:
-                        counts = np.bincount(valid.astype(np.int64))
-                        histo_counts = counts[b_min:b_max + 1]
-                        b_mode = int(b_min + np.argmax(histo_counts))
-                        histo_str = "|".join(map(str, histo_counts))
-                        num_bins = len(histo_counts)
-                    else:
-                        num_bins = min(256, max(10, span + 1))
-                        hist, bin_edges = np.histogram(valid, bins=num_bins, range=(b_min, b_max + 1))
-                        b_mode = int(bin_edges[np.argmax(hist)])
-                        histo_str = "|".join(map(str, hist))
-                else:
-                    # Uncalibrated / zero band handling (e.g. B1-B7, B58-B76, B225-B242)
-                    b_min, b_max, b_mean, b_std, b_median, b_mode = 0, 0, 0.0, 0.0, 0, 0
-                    num_bins = 1
-                    histo_str = "0"
-
-                scale_factor = vnir_scale if info["spectrometer"] == "VNIR" else swir_scale
-
-                dst.update_tags(
-                    out_idx,
-                    STATISTICS_MINIMUM=str(b_min),
-                    STATISTICS_MAXIMUM=str(b_max),
-                    STATISTICS_MEAN=f"{b_mean:.8f}",
-                    STATISTICS_STDDEV=f"{b_std:.8f}",
-                    STATISTICS_MEDIAN=str(b_median),
-                    STATISTICS_MODE=str(b_mode),
-                    STATISTICS_HISTONUMBINS=str(num_bins),
-                    STATISTICS_HISTOMIN=str(b_min),
-                    STATISTICS_HISTOMAX=str(b_max),
-                    STATISTICS_SKIPFACTORX="1",
-                    STATISTICS_SKIPFACTORY="1",
-                    STATISTICS_EXCLUDEDVALUES="0",
-                    LAYER_TYPE="athematic",
-                    STATISTICS_HISTOBINVALUES=histo_str,
-                    SENSOR="EO-1 Hyperion",
-                    HYPERION_BAND_NUMBER=str(b_num),
-                    SPECTROMETER=info["spectrometer"],
-                    WAVELENGTH=f"{info['wavelength_nm']:.2f} nm",
-                    FWHM=f"{info['fwhm_nm']:.2f} nm",
-                    RADIOMETRIC_SCALE=str(scale_factor),
-                    SCALE_FACTOR=str(scale_factor),
-                    CALIBRATED_STATUS="Calibrated" if info["is_calibrated"] else "Uncalibrated"
-                )
-
-                if out_idx % 25 == 0 or out_idx == num_bands:
-                    cal_str = "CAL" if info["is_calibrated"] else "ZERO"
-                    print(f"  [OK] Stacked Band {out_idx:03d} (Hyperion B{b_num:03d} | {info['wavelength_nm']:6.1f}nm | {info['spectrometer']} | {cal_str})")
-
-            # Embed dataset-level metadata
-            dst.update_tags(
-                SENSOR="NASA EO-1 Hyperion",
-                TOTAL_BANDS=str(num_bands),
-                RADIOMETRIC_UNITS="DN (Radiance W/(m^2*sr*um) = DN / ScaleFactor)",
-                VNIR_SCALE_FACTOR=str(vnir_scale),
-                SWIR_SCALE_FACTOR=str(swir_scale),
-                SPATIAL_RESOLUTION="30.0m",
-                ACQUISITION_DATE=str(mtl_info.get("ACQUISITION_DATE", "Unknown")) if mtl_info else "Unknown"
-            )
-
-            print("\nBuilding ERDAS Imagine overview pyramids [2, 4, 8, 16, 32, 64]...")
-            dst.build_overviews([2, 4, 8, 16, 32, 64], Resampling.average)
-
-    else:
-        driver = gdal.GetDriverByName("HFA")
-        if driver is None:
-            print("ERROR: GDAL HFA driver (ERDAS Imagine) is not available.")
-            sys.exit(1)
-
-        gdal_dtype = gdal.GDT_Byte if scale_to_8bit else ref_info["datatype"]
-        out_ds = driver.Create(
-            output_file,
-            ref_info["width"],
-            ref_info["height"],
-            num_bands,
-            gdal_dtype
-        )
-
-        if not out_ds:
-            print(f"ERROR: Could not create ERDAS Imagine file at '{output_file}'.")
-            sys.exit(1)
-
-        if ref_info.get("geotransform"):
-            out_ds.SetGeoTransform(ref_info["geotransform"])
-        if ref_info.get("projection"):
-            out_ds.SetProjection(ref_info["projection"])
-
-        for out_idx, b_num in enumerate(target_bands, start=1):
-            info = HYPERION_BAND_INFO.get(b_num, {
-                "wavelength_nm": 0.0,
-                "fwhm_nm": 10.0,
-                "spectrometer": "VNIR" if b_num <= 70 else "SWIR",
-                "scale_factor": vnir_scale if b_num <= 70 else swir_scale,
-                "is_calibrated": True
-            })
-
-            in_ds = gdal.Open(band_files[b_num], gdal.GA_ReadOnly)
-            in_band = in_ds.GetRasterBand(1)
-            data = in_band.ReadAsArray()
-            out_band = out_ds.GetRasterBand(out_idx)
-
-            if scale_to_8bit:
-                valid_mask = data > 0
-                if np.any(valid_mask):
-                    p2, p98 = np.percentile(data[valid_mask], [2, 98])
-                    scaled = np.clip((data.astype(np.float32) - p2) / max(p98 - p2, 1.0), 0.0, 1.0) * 254.0 + 1.0
-                    scaled[~valid_mask] = 0
-                    out_data = scaled.astype(np.uint8)
-                else:
-                    out_data = np.zeros_like(data, dtype=np.uint8)
-            else:
-                out_data = data
-
-            out_band.WriteArray(out_data)
-            out_band.SetNoDataValue(0)
-
-            valid = out_data[out_data > 0]
-            if np.any(valid):
-                b_min = float(np.min(valid))
-                b_max = float(np.max(valid))
-                b_mean = float(np.mean(valid))
-                b_std = float(np.std(valid))
-                b_median = int(np.median(valid))
-
-                span = int(b_max - b_min)
-                if 0 <= span <= 65536 and b_min >= 0:
-                    counts = np.bincount(valid.astype(np.int64))
-                    b_min_int = int(b_min)
-                    b_max_int = int(b_max)
-                    histo_counts = counts[b_min_int:b_max_int + 1]
-                    b_mode = int(b_min_int + np.argmax(histo_counts))
-                    histo_str = "|".join(map(str, histo_counts))
-                    num_bins = len(histo_counts)
-                else:
-                    num_bins = min(256, max(10, span + 1))
-                    hist, bin_edges = np.histogram(valid, bins=num_bins, range=(b_min, b_max + 1))
-                    b_mode = int(bin_edges[np.argmax(hist)])
-                    histo_str = "|".join(map(str, hist))
-            else:
-                b_min, b_max, b_mean, b_std, b_median, b_mode = 0.0, 0.0, 0.0, 0.0, 0, 0
-                num_bins = 1
-                histo_str = "0"
-
-            out_band.SetStatistics(b_min, b_max, b_mean, b_std)
-            out_band.SetMetadataItem("STATISTICS_EXCLUDEDVALUES", "0")
-            out_band.SetMetadataItem("LAYER_TYPE", "athematic")
-            out_band.SetMetadataItem("STATISTICS_MEDIAN", str(b_median))
-            out_band.SetMetadataItem("STATISTICS_MODE", str(b_mode))
-            out_band.SetMetadataItem("STATISTICS_HISTOBINVALUES", histo_str)
-            out_band.SetMetadataItem("STATISTICS_HISTONUMBINS", str(num_bins))
-            out_band.SetMetadataItem("STATISTICS_HISTOMIN", str(int(b_min)))
-            out_band.SetMetadataItem("STATISTICS_HISTOMAX", str(int(b_max)))
-            out_band.SetMetadataItem("STATISTICS_SKIPFACTORX", "1")
-            out_band.SetMetadataItem("STATISTICS_SKIPFACTORY", "1")
-
-            scale_factor = vnir_scale if info["spectrometer"] == "VNIR" else swir_scale
-            out_band.SetMetadataItem("HYPERION_BAND_NUMBER", str(b_num))
-            out_band.SetMetadataItem("SPECTROMETER", info["spectrometer"])
-            out_band.SetMetadataItem("WAVELENGTH", f"{info['wavelength_nm']:.2f} nm")
-            out_band.SetMetadataItem("FWHM", f"{info['fwhm_nm']:.2f} nm")
-            out_band.SetMetadataItem("RADIOMETRIC_SCALE", str(scale_factor))
-            out_band.SetMetadataItem("SCALE_FACTOR", str(scale_factor))
-            out_band.SetMetadataItem("CALIBRATED_STATUS", "Calibrated" if info["is_calibrated"] else "Uncalibrated")
-
-            out_band.FlushCache()
-            in_ds = None
-
-            if out_idx % 25 == 0 or out_idx == num_bands:
-                cal_str = "CAL" if info["is_calibrated"] else "ZERO"
-                print(f"  [OK] Stacked Band {out_idx:03d} (Hyperion B{b_num:03d} | {info['wavelength_nm']:6.1f}nm | {info['spectrometer']} | {cal_str})")
-
-        out_ds.SetMetadataItem("SENSOR", "NASA EO-1 Hyperion")
-        out_ds.SetMetadataItem("TOTAL_BANDS", str(num_bands))
-        out_ds.SetMetadataItem("RADIOMETRIC_UNITS", "DN (Radiance W/(m^2*sr*um) = DN / ScaleFactor)")
-        out_ds.SetMetadataItem("VNIR_SCALE_FACTOR", str(vnir_scale))
-        out_ds.SetMetadataItem("SWIR_SCALE_FACTOR", str(swir_scale))
-        out_ds.SetMetadataItem("SPATIAL_RESOLUTION", "30.0m")
-
-        print("\nBuilding ERDAS Imagine overview pyramids [2, 4, 8, 16, 32, 64]...")
-        out_ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32, 64])
-        out_ds.FlushCache()
-        out_ds = None
-
-    print("[OK] ERDAS Imagine raster stack created successfully.\n")
-
-
-# =============================================================================
-# ARCGIS-OPTIMIZED BIGTIFF STACKING ENGINE (.TIF)
-# =============================================================================
-
-def create_arcgis_stack(band_files, output_file, ref_info, target_bands, mtl_info=None, scale_to_8bit=False):
-    """
-    Creates an ArcGIS Pro / ArcMap optimized multi-band BigTIFF (.tif) raster.
-    Features:
-      - Driver: GTiff with BIGTIFF=IF_SAFER
-      - Lossless LZW compression (shrinks file size by 60-70% with full 16-bit fidelity)
-      - Internal tiling (256x256 blocks) for accelerated rendering in ArcGIS Pro
-      - Sets human-readable band descriptions (e.g. 'B029 (640.5 nm)') recognized by ArcGIS
-      - Embeds ESRI PAM metadata (.aux.xml) with full statistics & histograms
-      - Builds internal overviews [2, 4, 8, 16, 32, 64] with average resampling
-    """
-    num_bands = len(target_bands)
-    print(f"============================================================")
-    print(f"   CREATING ARCGIS-OPTIMIZED HYPERSPECTRAL STACK ({num_bands} BANDS) ")
-    print(f"============================================================\n")
-    print(f"Output File: {output_file}")
-    print(f"Format     : Cloud-Optimized BigTIFF (.tif) with LZW Compression")
-    print(f"Bit Depth  : {'8-bit Scaled' if scale_to_8bit else '16-bit Preserved Radiometric Data'}\n")
-
-    out_dtype = "uint8" if scale_to_8bit else ref_info["datatype"]
-    nodata_val = 0 if not scale_to_8bit else None
-
     vnir_scale = mtl_info.get("SCALING_FACTOR_VNIR", 40.0) if mtl_info else 40.0
     swir_scale = mtl_info.get("SCALING_FACTOR_SWIR", 80.0) if mtl_info else 80.0
 
@@ -949,7 +688,7 @@ def create_arcgis_stack(band_files, output_file, ref_info, target_bands, mtl_inf
 
                 dst.write(out_data, out_idx)
 
-                # Set ArcGIS Band Description & Wavelength
+                # Set ArcGIS human-readable band name and center wavelength
                 band_desc = f"B{b_num:03d} ({info['wavelength_nm']:.1f}nm)"
                 dst.set_band_description(out_idx, band_desc)
 
@@ -1008,7 +747,7 @@ def create_arcgis_stack(band_files, output_file, ref_info, target_bands, mtl_inf
 
                 if out_idx % 25 == 0 or out_idx == num_bands:
                     cal_str = "CAL" if info["is_calibrated"] else "ZERO"
-                    print(f"  [OK] ArcGIS Stacked Band {out_idx:03d} ({band_desc} | {info['spectrometer']} | {cal_str})")
+                    print(f"  [OK] Stacked Band {out_idx:03d} ({band_desc} | {info['spectrometer']} | {cal_str})")
 
             dst.update_tags(
                 SENSOR="NASA EO-1 Hyperion",
@@ -1020,8 +759,9 @@ def create_arcgis_stack(band_files, output_file, ref_info, target_bands, mtl_inf
                 ACQUISITION_DATE=str(mtl_info.get("ACQUISITION_DATE", "Unknown")) if mtl_info else "Unknown"
             )
 
-            print("\nBuilding ArcGIS internal overview pyramids [2, 4, 8, 16, 32, 64]...")
-            dst.build_overviews([2, 4, 8, 16, 32, 64], Resampling.average)
+            print("\nBuilding ArcGIS internal overview pyramids [2, 4, 8, 16, 32] (Multi-threaded)...")
+            with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS"):
+                dst.build_overviews([2, 4, 8, 16, 32], Resampling.average)
 
     else:
         driver = gdal.GetDriverByName("GTiff")
@@ -1142,7 +882,7 @@ def create_arcgis_stack(band_files, output_file, ref_info, target_bands, mtl_inf
 
             if out_idx % 25 == 0 or out_idx == num_bands:
                 cal_str = "CAL" if info["is_calibrated"] else "ZERO"
-                print(f"  [OK] ArcGIS Stacked Band {out_idx:03d} ({band_desc} | {info['spectrometer']} | {cal_str})")
+                print(f"  [OK] Stacked Band {out_idx:03d} ({band_desc} | {info['spectrometer']} | {cal_str})")
 
         out_ds.SetMetadataItem("SENSOR", "NASA EO-1 Hyperion")
         out_ds.SetMetadataItem("TOTAL_BANDS", str(num_bands))
@@ -1151,12 +891,18 @@ def create_arcgis_stack(band_files, output_file, ref_info, target_bands, mtl_inf
         out_ds.SetMetadataItem("SWIR_SCALE_FACTOR", str(swir_scale))
         out_ds.SetMetadataItem("SPATIAL_RESOLUTION", "30.0m")
 
-        print("\nBuilding ArcGIS internal overview pyramids [2, 4, 8, 16, 32, 64]...")
-        out_ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32, 64])
+        print("\nBuilding ArcGIS internal overview pyramids [2, 4, 8, 16, 32] (Multi-threaded)...")
+        gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
+        out_ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32])
         out_ds.FlushCache()
         out_ds = None
 
-    print("[OK] ArcGIS-optimized BigTIFF raster stack created successfully.\n")
+    print("[OK] ArcGIS Pro BigTIFF raster stack created successfully.\n")
+
+
+# Alias for backward compatibility with external scripts
+create_arcgis_stack = create_stack
+
 
 
 # =============================================================================
@@ -1414,40 +1160,30 @@ Examples:
     )
     parser.add_argument("--calibrated-only", action="store_true",
                         help="Stack only calibrated bands (B8-B57 and B77-B224, 198 bands) instead of all 242 bands")
-    parser.add_argument("--format", choices=["img", "tif", "both"], default="both",
-                        help="Output raster format: 'img' (ERDAS Imagine), 'tif' (ArcGIS Pro BigTIFF), or 'both' (default)")
     parser.add_argument("--force", "-y", action="store_true",
                         help="Overwrite existing output without interactive prompt")
     parser.add_argument("--scale-8bit", action="store_true",
                         help="Convert output to 8-bit stretched display raster instead of preserving 16-bit")
     parser.add_argument("--input", default=None,
                         help="Custom input directory (defaults to ./input)")
+    parser.add_argument("--processing", default=None,
+                        help="Custom processing staging directory (defaults to ./processing)")
     parser.add_argument("--output", default=None,
                         help="Custom output directory (defaults to ./output)")
 
     args = parser.parse_args()
 
     print("=================================================================")
-    print("        NASA EO-1 HYPERION HYPERSPECTRAL STACKER PIPELINE        ")
+    print("      NASA EO-1 HYPERION ARCGIS PRO HYPERSPECTRAL PIPELINE       ")
     print("=================================================================")
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     input_dir = os.path.abspath(args.input) if args.input else os.path.join(base_dir, "input")
-    processing_dir = os.path.join(base_dir, "processing")
+    processing_dir = os.path.abspath(args.processing) if args.processing else os.path.join(base_dir, "processing")
     output_dir = os.path.abspath(args.output) if args.output else os.path.join(base_dir, "output")
 
     base_name = "Hyperion_Stacked_CalibratedOnly" if args.calibrated_only else "Hyperion_Stacked"
-    img_output_file = os.path.join(output_dir, f"{base_name}.img")
-    tif_output_file = os.path.join(output_dir, f"{base_name}.tif")
-
-    build_img = args.format in ["img", "both"]
-    build_tif = args.format in ["tif", "both"]
-
-    target_outputs = []
-    if build_img:
-        target_outputs.append(img_output_file)
-    if build_tif:
-        target_outputs.append(tif_output_file)
+    output_file = os.path.join(output_dir, f"{base_name}.tif")
 
     # Preview files to clean on overwrite
     preview_files = [os.path.join(output_dir, f) for f in PREVIEW_COMPOSITES.keys()]
@@ -1457,10 +1193,8 @@ Examples:
     os.makedirs(input_dir, exist_ok=True)
 
     # Handle Windows file lock conflicts and existing outputs
-    existing = [f for f in target_outputs if os.path.exists(f)]
-    if existing:
-        names = ", ".join(os.path.basename(f) for f in existing)
-        print(f"\nExisting output detected: {names}")
+    if os.path.exists(output_file):
+        print(f"\nExisting output detected: '{os.path.basename(output_file)}'")
         if not sys.stdin.isatty() or args.force:
             response = "y"
         else:
@@ -1474,20 +1208,19 @@ Examples:
             sys.exit(0)
 
         try:
-            sidecar_exts = [".aux.xml", ".rrd", ".ige", ".ovr", ".aux"]
-            files_to_remove = list(existing) + preview_files
-            for out_f in existing:
-                base_path = os.path.splitext(out_f)[0]
-                for ext in sidecar_exts:
-                    files_to_remove.append(out_f + ext)
-                    files_to_remove.append(base_path + ext)
+            sidecar_exts = [".aux.xml", ".ovr", ".aux"]
+            files_to_remove = [output_file] + preview_files
+            base_path = os.path.splitext(output_file)[0]
+            for ext in sidecar_exts:
+                files_to_remove.append(output_file + ext)
+                files_to_remove.append(base_path + ext)
 
             for f in set(files_to_remove):
                 if os.path.exists(f):
                     os.remove(f)
         except PermissionError as pe:
-            print(f"\nERROR: Could not overwrite output files ({pe}) because a raster is currently open in a GIS application (ERDAS Imagine, ArcGIS Pro, ENVI, or QGIS).")
-            print("Please close the file in your GIS software and re-run the pipeline.")
+            print(f"\nERROR: Could not overwrite '{os.path.basename(output_file)}' ({pe}) because it is open in ArcGIS Pro or QGIS.")
+            print("Please close the file in ArcGIS Pro and re-run the pipeline.")
             sys.exit(1)
         except Exception as e:
             print(f"ERROR: Could not clean existing output files: {e}")
@@ -1506,31 +1239,20 @@ Examples:
     # Step 3: Geometry & Spatial Reference Validation
     ref_info = validate_bands(band_files, target_bands)
 
-    # Step 4: Stacking Engine Executions
-    if build_img:
-        create_stack(band_files, img_output_file, ref_info, target_bands, mtl_info=mtl_info, scale_to_8bit=args.scale_8bit)
-        verify_output(img_output_file, ref_info, len(target_bands))
-        check_data_integrity(img_output_file, target_bands)
+    # Step 4: Stacking Engine (ArcGIS Pro Cloud-Optimized BigTIFF)
+    create_stack(band_files, output_file, ref_info, target_bands, mtl_info=mtl_info, scale_to_8bit=args.scale_8bit)
+    verify_output(output_file, ref_info, len(target_bands))
+    check_data_integrity(output_file, target_bands)
 
-    if build_tif:
-        create_arcgis_stack(band_files, tif_output_file, ref_info, target_bands, mtl_info=mtl_info, scale_to_8bit=args.scale_8bit)
-        verify_output(tif_output_file, ref_info, len(target_bands))
-        check_data_integrity(tif_output_file, target_bands)
-
-    # Step 5: Calibrated Full-Color PNG Preview Composites (rendered from primary output)
-    preview_source = img_output_file if build_img else tif_output_file
-    create_all_previews(preview_source, output_dir, target_bands)
+    # Step 5: Calibrated Full-Color PNG Preview Composites
+    create_all_previews(output_file, output_dir, target_bands)
 
     print("=================================================================")
     print("                     PIPELINE COMPLETED SUCCESSFULLY             ")
     print("=================================================================")
-    print(f"\nCreated Deliverables:")
-    if build_img:
-        print(f"  - ERDAS Imagine Stack : {img_output_file}")
-        print(f"    * Driver            : ERDAS Imagine HFA (.img) with Overviews [2..64]")
-    if build_tif:
-        print(f"  - ArcGIS Pro Stack    : {tif_output_file}")
-        print(f"    * Driver            : Cloud-Optimized BigTIFF (.tif) [LZW, 256x256 Tiled, Overviews]")
+    print(f"\nCreated Deliverables for ArcGIS Pro:")
+    print(f"  - ArcGIS Pro Stack    : {output_file}")
+    print(f"    * Driver            : Cloud-Optimized BigTIFF (.tif) [LZW, 256x256 Tiled, Overviews]")
     print(f"    * Bands Staged      : {len(target_bands)} bands")
     print(f"    * Radiometric Spec  : VNIR (B1-B70, /40.0) | SWIR (B71-B242, /80.0)")
     print(f"  - True Color Preview  : {os.path.join(output_dir, 'Hyperion_TrueColor_Preview.png')}")

@@ -70,6 +70,8 @@ Examples:
                         help="Convert output to 8-bit display raster instead of preserving 16-bit")
     parser.add_argument("--input", default=None,
                         help="Custom input directory (defaults to ./input)")
+    parser.add_argument("--processing", default=None,
+                        help="Custom processing staging directory (defaults to ./processing)")
     parser.add_argument("--output", default=None,
                         help="Custom output directory (defaults to ./output)")
 
@@ -81,7 +83,7 @@ Examples:
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     input_dir = os.path.abspath(args.input) if args.input else os.path.join(base_dir, "input")
-    processing_dir = os.path.join(base_dir, "processing")
+    processing_dir = os.path.abspath(args.processing) if args.processing else os.path.join(base_dir, "processing")
     output_dir = os.path.abspath(args.output) if args.output else os.path.join(base_dir, "output")
 
     base_name = "Hyperion_Stacked_CalibratedOnly" if args.calibrated_only else "Hyperion_Stacked"

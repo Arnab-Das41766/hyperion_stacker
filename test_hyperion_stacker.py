@@ -129,6 +129,7 @@ def run_tests():
         sys.executable,
         stacker_script,
         "--input", test_input,
+        "--processing", test_processing,
         "--output", test_output,
         "--force"
     ]
@@ -141,9 +142,7 @@ def run_tests():
 
     # 3. Verify created outputs
     print("\n[Step 4] Checking output artifacts in output/ ...")
-    stacked_img = os.path.join(test_output, "Hyperion_Stacked.img")
     stacked_tif = os.path.join(test_output, "Hyperion_Stacked.tif")
-    assert os.path.exists(stacked_img), f"Missing ERDAS stacked raster: {stacked_img}"
     assert os.path.exists(stacked_tif), f"Missing ArcGIS stacked raster: {stacked_tif}"
 
     previews = [
@@ -158,40 +157,36 @@ def run_tests():
         assert os.path.getsize(p_path) > 0, f"Empty preview composite: {p_path}"
         print(f"  [VERIFIED] {p} ({os.path.getsize(p_path):,} bytes)")
 
-    # Inspect ERDAS stacked raster properties
-    with rasterio.open(stacked_img) as ds:
-        assert ds.count == 242, f"Expected 242 bands, got {ds.count}"
-        assert ds.width == width and ds.height == height
-        assert ds.crs.to_string() == "EPSG:32631"
-        assert ds.dtypes[0] == "int16"
-        tags_b29 = ds.tags(29)
+    # Inspect ArcGIS stacked raster properties
+    with rasterio.open(stacked_tif) as ds_tif:
+        assert ds_tif.count == 242, f"Expected 242 bands in .tif, got {ds_tif.count}"
+        assert ds_tif.width == width and ds_tif.height == height
+        assert ds_tif.crs.to_string() == "EPSG:32631"
+        assert ds_tif.dtypes[0] == "int16"
+        assert ds_tif.profile.get("compress") == "lzw"
+        assert ds_tif.profile.get("tiled") is True
+        assert len(ds_tif.descriptions) == 242
+
+        tags_b29 = ds_tif.tags(29)
         assert "STATISTICS_MINIMUM" in tags_b29
         assert "STATISTICS_HISTOBINVALUES" in tags_b29
         assert "SCALE_FACTOR" in tags_b29
         assert tags_b29["SPECTROMETER"] == "VNIR"
         assert tags_b29["SCALE_FACTOR"] == "40.0"
 
-        tags_b204 = ds.tags(204)
+        tags_b204 = ds_tif.tags(204)
         assert tags_b204["SPECTROMETER"] == "SWIR"
         assert tags_b204["SCALE_FACTOR"] == "80.0"
 
-        ovr_factors = ds.overviews(1)
-        print(f"  [VERIFIED] ERDAS Overviews: {ovr_factors}")
-        assert len(ovr_factors) > 0, "No overviews built in .img!"
-
-    # Inspect ArcGIS stacked raster properties
-    with rasterio.open(stacked_tif) as ds_tif:
-        assert ds_tif.count == 242, f"Expected 242 bands in .tif, got {ds_tif.count}"
-        assert ds_tif.width == width and ds_tif.height == height
-        assert ds_tif.profile.get("compress") == "lzw"
-        assert ds_tif.profile.get("tiled") is True
-        assert len(ds_tif.descriptions) == 242
+        ovr_factors = ds_tif.overviews(1)
         print(f"  [VERIFIED] ArcGIS BigTIFF: LZW Compressed, 256x256 Tiled, Band 29='{ds_tif.descriptions[28]}'")
+        print(f"  [VERIFIED] Overviews built: {ovr_factors}")
+        assert len(ovr_factors) > 0, "No overviews built in .tif!"
 
-    print("  [VERIFIED] Both ERDAS Imagine (.img) and ArcGIS Pro (.tif) Stacks verified.")
+    print("  [VERIFIED] ArcGIS Pro BigTIFF (.tif) Stack verified.")
 
-    # 4. Test compare_hyperion_stacks.py (comparing .img vs .tif)
-    print("\n[Step 5] Testing compare_hyperion_stacks.py (Cross-verifying ERDAS .img vs ArcGIS .tif)...")
+    # 4. Test compare_hyperion_stacks.py
+    print("\n[Step 5] Testing compare_hyperion_stacks.py...")
     compare_script = os.path.join(base_dir, "compare_hyperion_stacks.py")
     comp_plot = os.path.join(test_output, "spectral_test_plot.png")
     comp_csv = os.path.join(test_output, "spectral_test_profiles.csv")
@@ -199,7 +194,7 @@ def run_tests():
     comp_cmd = [
         sys.executable,
         compare_script,
-        stacked_img,
+        stacked_tif,
         stacked_tif,
         "--save-plot", comp_plot,
         "--csv", comp_csv
@@ -222,6 +217,7 @@ def run_tests():
     res_arc = subprocess.run([
         sys.executable, arcgis_script,
         "--input", test_input,
+        "--processing", test_processing,
         "--output", test_output,
         "--force"
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -232,12 +228,13 @@ def run_tests():
     print("  [VERIFIED] Standalone Hyperion_ArcGIS_Stacker executed successfully.")
 
     # 5. Test --calibrated-only mode
-    print("\n[Step 6] Testing --calibrated-only mode (198 bands)...")
+    print("\n[Step 7] Testing --calibrated-only mode (198 bands)...")
     cal_cmd = [
         sys.executable,
         stacker_script,
         "--calibrated-only",
         "--input", test_input,
+        "--processing", test_processing,
         "--output", test_output,
         "--force"
     ]
@@ -247,7 +244,7 @@ def run_tests():
         print(res_cal.stderr)
         sys.exit(1)
 
-    cal_stacked = os.path.join(test_output, "Hyperion_Stacked_CalibratedOnly.img")
+    cal_stacked = os.path.join(test_output, "Hyperion_Stacked_CalibratedOnly.tif")
     assert os.path.exists(cal_stacked), f"Missing calibrated-only stack: {cal_stacked}"
     with rasterio.open(cal_stacked) as ds_cal:
         assert ds_cal.count == 198, f"Expected 198 bands in calibrated-only mode, got {ds_cal.count}"
