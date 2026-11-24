@@ -142,7 +142,9 @@ def run_tests():
     # 3. Verify created outputs
     print("\n[Step 4] Checking output artifacts in output/ ...")
     stacked_img = os.path.join(test_output, "Hyperion_Stacked.img")
-    assert os.path.exists(stacked_img), f"Missing stacked raster: {stacked_img}"
+    stacked_tif = os.path.join(test_output, "Hyperion_Stacked.tif")
+    assert os.path.exists(stacked_img), f"Missing ERDAS stacked raster: {stacked_img}"
+    assert os.path.exists(stacked_tif), f"Missing ArcGIS stacked raster: {stacked_tif}"
 
     previews = [
         "Hyperion_TrueColor_Preview.png",
@@ -156,7 +158,7 @@ def run_tests():
         assert os.path.getsize(p_path) > 0, f"Empty preview composite: {p_path}"
         print(f"  [VERIFIED] {p} ({os.path.getsize(p_path):,} bytes)")
 
-    # Inspect stacked raster properties
+    # Inspect ERDAS stacked raster properties
     with rasterio.open(stacked_img) as ds:
         assert ds.count == 242, f"Expected 242 bands, got {ds.count}"
         assert ds.width == width and ds.height == height
@@ -173,15 +175,23 @@ def run_tests():
         assert tags_b204["SPECTROMETER"] == "SWIR"
         assert tags_b204["SCALE_FACTOR"] == "80.0"
 
-        # Check overviews
         ovr_factors = ds.overviews(1)
-        print(f"  [VERIFIED] Embedded Overviews: {ovr_factors}")
-        assert len(ovr_factors) > 0, "No overviews built!"
+        print(f"  [VERIFIED] ERDAS Overviews: {ovr_factors}")
+        assert len(ovr_factors) > 0, "No overviews built in .img!"
 
-    print("  [VERIFIED] Full 242-Band ERDAS Imagine Stack properties and metadata verified.")
+    # Inspect ArcGIS stacked raster properties
+    with rasterio.open(stacked_tif) as ds_tif:
+        assert ds_tif.count == 242, f"Expected 242 bands in .tif, got {ds_tif.count}"
+        assert ds_tif.width == width and ds_tif.height == height
+        assert ds_tif.profile.get("compress") == "lzw"
+        assert ds_tif.profile.get("tiled") is True
+        assert len(ds_tif.descriptions) == 242
+        print(f"  [VERIFIED] ArcGIS BigTIFF: LZW Compressed, 256x256 Tiled, Band 29='{ds_tif.descriptions[28]}'")
 
-    # 4. Test compare_hyperion_stacks.py
-    print("\n[Step 5] Testing compare_hyperion_stacks.py...")
+    print("  [VERIFIED] Both ERDAS Imagine (.img) and ArcGIS Pro (.tif) Stacks verified.")
+
+    # 4. Test compare_hyperion_stacks.py (comparing .img vs .tif)
+    print("\n[Step 5] Testing compare_hyperion_stacks.py (Cross-verifying ERDAS .img vs ArcGIS .tif)...")
     compare_script = os.path.join(base_dir, "compare_hyperion_stacks.py")
     comp_plot = os.path.join(test_output, "spectral_test_plot.png")
     comp_csv = os.path.join(test_output, "spectral_test_profiles.csv")
@@ -190,7 +200,7 @@ def run_tests():
         sys.executable,
         compare_script,
         stacked_img,
-        stacked_img,
+        stacked_tif,
         "--save-plot", comp_plot,
         "--csv", comp_csv
     ]
@@ -205,6 +215,21 @@ def run_tests():
     assert os.path.exists(comp_csv), f"Missing CSV: {comp_csv}"
     print(f"  [VERIFIED] Spectral comparison plot generated: {comp_plot} ({os.path.getsize(comp_plot):,} bytes)")
     print(f"  [VERIFIED] Spectral profiles CSV exported: {comp_csv} ({os.path.getsize(comp_csv):,} bytes)")
+
+    # 5. Test Hyperion_ArcGIS_Stacker.py
+    print("\n[Step 6] Testing standalone Hyperion_ArcGIS_Stacker.py...")
+    arcgis_script = os.path.join(base_dir, "Hyperion_ArcGIS_Stacker.py")
+    res_arc = subprocess.run([
+        sys.executable, arcgis_script,
+        "--input", test_input,
+        "--output", test_output,
+        "--force"
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res_arc.returncode != 0:
+        print(f"FAILED: Hyperion_ArcGIS_Stacker exited with code {res_arc.returncode}")
+        print(res_arc.stderr)
+        sys.exit(1)
+    print("  [VERIFIED] Standalone Hyperion_ArcGIS_Stacker executed successfully.")
 
     # 5. Test --calibrated-only mode
     print("\n[Step 6] Testing --calibrated-only mode (198 bands)...")

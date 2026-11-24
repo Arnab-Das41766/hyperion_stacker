@@ -138,11 +138,34 @@ Download a NASA EO-1 Hyperion scene from [USGS EarthExplorer](https://earthexplo
 - **Archives supported**: `EO1H*.tar.gz`, `EO1H*.tar`, `EO1H*.zip`, `EO1H*.rar`, `EO1H*.7z`
 - **Loose files supported**: Folder containing `*_B001_*.TIF` through `*_B242_*.TIF` and `*_MTL.txt`
 
+| **`output/Hyperion_Stacked.img`** | Full 16-bit 242-band ERDAS Imagine HFA raster stack with embedded statistics & overviews |
+| **`output/Hyperion_Stacked.tif`** | ArcGIS Pro / ArcMap optimized Cloud-Optimized BigTIFF with lossless LZW compression & 256x256 internal tiling |
+| **`output/Hyperion_TrueColor_Preview.png`** | Natural True Color RGB composite (Bands 29 - 20 - 13) |
+| **`output/Hyperion_CIR_Vegetation_Preview.png`** | Color Infrared / CIR composite (Bands 50 - 30 - 20) |
+| **`output/Hyperion_SWIR_Geology_Preview.png`** | Shortwave Infrared mineral / geology composite (Bands 204 - 150 - 50) |
+| **`output/Hyperion_Vegetation_Stress_Preview.png`** | Red-edge & vegetation chlorophyll stress composite (Bands 53 - 35 - 22) |
+
+---
+
+## 🚀 Quick Start Guide
+
+### 1. Place Input Data
+Download a NASA EO-1 Hyperion scene from [USGS EarthExplorer](https://earthexplorer.usgs.gov/) and place the archive directly into `input/`:
+- **Archives supported**: `EO1H*.tar.gz`, `EO1H*.tar`, `EO1H*.zip`, `EO1H*.rar`, `EO1H*.7z`
+- **Loose files supported**: Folder containing `*_B001_*.TIF` through `*_B242_*.TIF` and `*_MTL.txt`
+
 ### 2. Run the Stacker Pipeline
 
-#### Default: Full 242-Band USGS Standard Stack
+#### Default: Generate Both ERDAS Imagine (.img) and ArcGIS Pro BigTIFF (.tif)
 ```cmd
 python Hyperion_Stacker.py
+```
+
+#### Option: Generate Specifically for ArcGIS Pro (.tif with LZW Compression & Internal Tiling)
+```cmd
+python Hyperion_ArcGIS_Stacker.py
+# Or via main script:
+python Hyperion_Stacker.py --format tif
 ```
 
 #### Option: Stack Calibrated Bands Only (198 Bands)
@@ -152,6 +175,7 @@ python Hyperion_Stacker.py --calibrated-only
 ```
 
 #### Additional CLI Options:
+- `--format {img,tif,both}`: Select output raster format (default: `both`).
 - `--force` or `-y`: Overwrite existing outputs without confirmation prompt.
 - `--scale-8bit`: Generate an 8-bit stretched display stack instead of preserving 16-bit radiometry.
 - `--input <path>`: Specify a custom input directory.
