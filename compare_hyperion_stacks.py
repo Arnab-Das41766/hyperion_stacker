@@ -2,7 +2,7 @@
 """
 Hyperion Stack Comparison & Spectral Verification Tool
 ======================================================
-CLI tool to compare two ERDAS Imagine (.img) Hyperion hyperspectral stacks:
+CLI tool to compare two Hyperion hyperspectral stacks (.tif / .img):
   - Validates band counts, spatial dimensions, CRS, and geotransforms.
   - Compares statistical distributions across diagnostic bands:
     * Band 13 (~477.7 nm, Visible Blue)
@@ -37,6 +37,7 @@ if "MPLCONFIGDIR" not in os.environ:
 
 import argparse
 import csv
+import re
 import numpy as np
 
 # Dual support: Try rasterio first, fallback to osgeo.gdal
@@ -93,6 +94,42 @@ def get_scale_factor(b):
     return 40.0 if b <= 70 else 80.0
 
 
+def build_band_map(ds, count):
+    """Maps true Hyperion band numbers (1..242) to 1-based stack indices."""
+    band_map = {}
+    desc_re = re.compile(r"B0*([1-9][0-9]{0,2})", re.IGNORECASE)
+    for idx in range(1, count + 1):
+        hyp_num = None
+        if USE_RASTERIO:
+            tags = ds.tags(idx)
+            if "HYPERION_BAND_NUMBER" in tags:
+                try:
+                    hyp_num = int(tags["HYPERION_BAND_NUMBER"])
+                except ValueError:
+                    hyp_num = None
+            if hyp_num is None and ds.descriptions and idx - 1 < len(ds.descriptions) and ds.descriptions[idx - 1]:
+                m = desc_re.search(ds.descriptions[idx - 1])
+                if m:
+                    hyp_num = int(m.group(1))
+        else:
+            band = ds.GetRasterBand(idx)
+            tag_val = band.GetMetadataItem("HYPERION_BAND_NUMBER")
+            if tag_val:
+                try:
+                    hyp_num = int(tag_val)
+                except ValueError:
+                    hyp_num = None
+            if hyp_num is None:
+                desc = band.GetDescription() or ""
+                m = desc_re.search(desc)
+                if m:
+                    hyp_num = int(m.group(1))
+        if hyp_num is None:
+            hyp_num = idx
+        band_map[hyp_num] = idx
+    return band_map
+
+
 def compare_rasters(path1, path2, output_plot="hyperion_spectral_comparison.png", output_csv="hyperion_spectral_profiles.csv", custom_points=None):
     print("=================================================================")
     print("       HYPERION HYPERSPECTRAL STACK COMPARISON & VERIFICATION     ")
@@ -139,8 +176,10 @@ def compare_rasters(path1, path2, output_plot="hyperion_spectral_comparison.png"
     print(f"CRS / Spatial: {'MATCH' if str(crs1) == str(crs2) else 'CHECK'}")
     print(f"Geotransform : {'MATCH' if str(gt1) == str(gt2) else 'CHECK'}\n")
 
-    # Determine comparable bands
-    common_count = min(count1, count2)
+    # Map true Hyperion band numbers to stack indices (supports both 242-band and 198-band stacks)
+    map1 = build_band_map(ds1, count1)
+    map2 = build_band_map(ds2, count2)
+    common_hyp_bands = sorted(set(map1.keys()) & set(map2.keys()))
 
     print("-----------------------------------------------------------------")
     print("2. DIAGNOSTIC BAND STATISTICS & RADIOMETRIC DISTRIBUTION")
@@ -149,16 +188,17 @@ def compare_rasters(path1, path2, output_plot="hyperion_spectral_comparison.png"
     stats_summary = []
 
     for b, label in DIAGNOSTIC_BANDS:
-        if b > common_count:
-            print(f"Skipping {label}: band index exceeds raster band count ({common_count}).")
+        if b not in map1 or b not in map2:
+            print(f"Skipping {label}: band B{b:03d} not present in both stacks.")
             continue
 
+        idx1, idx2 = map1[b], map2[b]
         if USE_RASTERIO:
-            arr1 = ds1.read(b)
-            arr2 = ds2.read(b)
+            arr1 = ds1.read(idx1)
+            arr2 = ds2.read(idx2)
         else:
-            arr1 = ds1.GetRasterBand(b).ReadAsArray()
-            arr2 = ds2.GetRasterBand(b).ReadAsArray()
+            arr1 = ds1.GetRasterBand(idx1).ReadAsArray()
+            arr2 = ds2.GetRasterBand(idx2).ReadAsArray()
 
         equal = np.array_equal(arr1, arr2)
 
@@ -195,9 +235,14 @@ def compare_rasters(path1, path2, output_plot="hyperion_spectral_comparison.png"
     print("-----------------------------------------------------------------")
 
     # Read diagnostic bands to auto-detect sample pixels
-    b_nir = min(50, common_count)
-    b_red = min(29, common_count)
-    b_swir = min(150, common_count)
+    def _nearest_stack_idx(b_map, target_b):
+        if target_b in b_map:
+            return b_map[target_b]
+        return b_map[min(b_map.keys(), key=lambda k: abs(k - target_b))]
+
+    b_nir = _nearest_stack_idx(map1, 50)
+    b_red = _nearest_stack_idx(map1, 29)
+    b_swir = _nearest_stack_idx(map1, 150)
 
     if USE_RASTERIO:
         nir_arr = ds1.read(b_nir).astype(np.float32)
@@ -241,29 +286,30 @@ def compare_rasters(path1, path2, output_plot="hyperion_spectral_comparison.png"
         for idx_p, (px, py) in enumerate(custom_points, start=1):
             sample_targets.append((f"Custom Point #{idx_p}", int(px), int(py)))
 
-    # Extract profiles across all bands
-    wavelengths = [get_wavelength(b) for b in range(1, common_count + 1)]
+    # Extract profiles across all common Hyperion bands
+    wavelengths = [get_wavelength(b_num) for b_num in common_hyp_bands]
     profiles_data = []
 
-    print(f"Sampling {len(sample_targets)} diagnostic spectral locations across {common_count} bands:")
+    print(f"Sampling {len(sample_targets)} diagnostic spectral locations across {len(common_hyp_bands)} bands:")
     for target_label, px, py in sample_targets:
         print(f"  Target: {target_label} at pixel (X={px}, Y={py})")
 
         spec1 = []
         spec2 = []
 
-        for b in range(1, common_count + 1):
+        for b_num in common_hyp_bands:
+            idx1, idx2 = map1[b_num], map2[b_num]
             if USE_RASTERIO:
-                v1 = float(ds1.read(b, window=rasterio.windows.Window(px, py, 1, 1))[0, 0])
-                v2 = float(ds2.read(b, window=rasterio.windows.Window(px, py, 1, 1))[0, 0])
+                v1 = float(ds1.read(idx1, window=rasterio.windows.Window(px, py, 1, 1))[0, 0])
+                v2 = float(ds2.read(idx2, window=rasterio.windows.Window(px, py, 1, 1))[0, 0])
             else:
-                v1 = float(ds1.GetRasterBand(b).ReadAsArray(px, py, 1, 1)[0, 0])
-                v2 = float(ds2.GetRasterBand(b).ReadAsArray(px, py, 1, 1)[0, 0])
+                v1 = float(ds1.GetRasterBand(idx1).ReadAsArray(px, py, 1, 1)[0, 0])
+                v2 = float(ds2.GetRasterBand(idx2).ReadAsArray(px, py, 1, 1)[0, 0])
 
             # Convert to spectral radiance W/(m^2*sr*um)
-            sf = get_scale_factor(b)
-            rad1 = v1 / sf if (8 <= b <= 57 or 77 <= b <= 224) and v1 > 0 else 0.0
-            rad2 = v2 / sf if (8 <= b <= 57 or 77 <= b <= 224) and v2 > 0 else 0.0
+            sf = get_scale_factor(b_num)
+            rad1 = v1 / sf if (8 <= b_num <= 57 or 77 <= b_num <= 224) and v1 > 0 else 0.0
+            rad2 = v2 / sf if (8 <= b_num <= 57 or 77 <= b_num <= 224) and v2 > 0 else 0.0
 
             spec1.append(rad1)
             spec2.append(rad2)
@@ -286,8 +332,7 @@ def compare_rasters(path1, path2, output_plot="hyperion_spectral_comparison.png"
                 header.append(f"{target['label']}_Stack2_Radiance")
             writer.writerow(header)
 
-            for b_idx in range(common_count):
-                b_num = b_idx + 1
+            for b_idx, b_num in enumerate(common_hyp_bands):
                 wl = wavelengths[b_idx]
                 spec_name = "VNIR" if b_num <= 70 else "SWIR"
                 row = [b_num, f"{wl:.2f}", spec_name]
@@ -308,8 +353,8 @@ def compare_rasters(path1, path2, output_plot="hyperion_spectral_comparison.png"
 
         # Identify calibrated band indices (masking zero / uncalibrated bands)
         valid_b_indices = [
-            i for i in range(common_count)
-            if (8 <= (i + 1) <= 57) or (77 <= (i + 1) <= 224)
+            i for i, b_num in enumerate(common_hyp_bands)
+            if (8 <= b_num <= 57) or (77 <= b_num <= 224)
         ]
         wl_sub = [wavelengths[i] for i in valid_b_indices]
 
@@ -356,8 +401,8 @@ def main():
         description="NASA EO-1 Hyperion Hyperspectral Stack Comparison Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("stack1", help="Path to first ERDAS Imagine stack (.img)")
-    parser.add_argument("stack2", help="Path to second ERDAS Imagine stack (.img)")
+    parser.add_argument("stack1", help="Path to first Hyperion stack (.tif / .img)")
+    parser.add_argument("stack2", help="Path to second Hyperion stack (.tif / .img)")
     parser.add_argument("--save-plot", default="hyperion_spectral_comparison.png",
                         help="Output path for spectral signature plot (PNG)")
     parser.add_argument("--csv", default="hyperion_spectral_profiles.csv",

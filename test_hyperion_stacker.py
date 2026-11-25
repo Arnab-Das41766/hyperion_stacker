@@ -211,24 +211,8 @@ def run_tests():
     print(f"  [VERIFIED] Spectral comparison plot generated: {comp_plot} ({os.path.getsize(comp_plot):,} bytes)")
     print(f"  [VERIFIED] Spectral profiles CSV exported: {comp_csv} ({os.path.getsize(comp_csv):,} bytes)")
 
-    # 5. Test Hyperion_ArcGIS_Stacker.py
-    print("\n[Step 6] Testing standalone Hyperion_ArcGIS_Stacker.py...")
-    arcgis_script = os.path.join(base_dir, "Hyperion_ArcGIS_Stacker.py")
-    res_arc = subprocess.run([
-        sys.executable, arcgis_script,
-        "--input", test_input,
-        "--processing", test_processing,
-        "--output", test_output,
-        "--force"
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res_arc.returncode != 0:
-        print(f"FAILED: Hyperion_ArcGIS_Stacker exited with code {res_arc.returncode}")
-        print(res_arc.stderr)
-        sys.exit(1)
-    print("  [VERIFIED] Standalone Hyperion_ArcGIS_Stacker executed successfully.")
-
     # 5. Test --calibrated-only mode
-    print("\n[Step 7] Testing --calibrated-only mode (198 bands)...")
+    print("\n[Step 6] Testing --calibrated-only mode (198 bands)...")
     cal_cmd = [
         sys.executable,
         stacker_script,

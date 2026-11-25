@@ -5,9 +5,9 @@ Hyperion Stacker - Production-Ready Automated Hyperspectral Stacking Pipeline
 Automated ingestion, validation, calibration metadata embedding, and stacking
 for NASA Earth Observing-1 (EO-1) Hyperion hyperspectral imagery.
 
-Produces an ERDAS Imagine HFA (.img) raster with full 16-bit radiometric fidelity,
-embedded statistics, pyramids/overviews, and 4 calibrated publication-grade PNG
-preview composites.
+Produces an ArcGIS Pro Cloud-Optimized BigTIFF (.tif) raster with full 16-bit
+radiometric fidelity, embedded statistics, pyramids/overviews, and 4 calibrated
+publication-grade PNG preview composites.
 
 Sensor Specifications:
   - Spectrometer: NASA EO-1 Hyperion
@@ -39,6 +39,8 @@ if "MPLCONFIGDIR" not in os.environ:
     os.environ["MPLCONFIGDIR"] = os.path.join(os.environ.get("TEMP", os.environ.get("TMP", ".")), "matplotlib_cache")
 
 import re
+import time
+import threading
 import shutil
 import zipfile
 import tarfile
@@ -72,6 +74,55 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
+
+
+# =============================================================================
+# REAL-TIME TERMINAL PROGRESS BAR UTILITIES
+# =============================================================================
+
+def render_progress_bar(current, total, prefix="", suffix="", bar_len=30):
+    """Renders a single-line real-time progress bar to stdout."""
+    total = max(total, 1)
+    ratio = min(max(current / float(total), 0.0), 1.0)
+    filled = int(round(bar_len * ratio))
+    bar = "#" * filled + "-" * (bar_len - filled)
+    pct = ratio * 100.0
+    line = f"\r{prefix} [{bar}] {pct:5.1f}% ({current}/{total}) {suffix}"
+    sys.stdout.write(line.ljust(95))
+    sys.stdout.flush()
+
+
+class SpinnerTimer:
+    """Background spinner with elapsed timer for blocking C/GDAL calls."""
+    def __init__(self, label):
+        self.label = label
+        self._stop = threading.Event()
+        self._thread = None
+        self._start = 0.0
+
+    def _run(self):
+        frames = ["|", "/", "-", "\\"]
+        idx = 0
+        while not self._stop.is_set():
+            elapsed = time.time() - self._start
+            sys.stdout.write(f"\r  [{frames[idx % 4]}] {self.label} | Elapsed: {elapsed:5.1f}s".ljust(95))
+            sys.stdout.flush()
+            idx += 1
+            self._stop.wait(0.25)
+
+    def __enter__(self):
+        self._start = time.time()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        elapsed = time.time() - self._start
+        sys.stdout.write(f"\r  [OK] {self.label} | Done in {elapsed:5.1f}s".ljust(95) + "\n")
+        sys.stdout.flush()
 
 
 # =============================================================================
@@ -343,13 +394,22 @@ def prepare_processing_folder(input_dir, processing_dir, calibrated_only=False):
     if not os.path.exists(input_dir):
         os.makedirs(input_dir, exist_ok=True)
 
-    # Recreate clean processing directory
-    if os.path.exists(processing_dir):
+    # Clean processing directory while preserving .gitkeep
+    os.makedirs(processing_dir, exist_ok=True)
+    for item in os.listdir(processing_dir):
+        if item == ".gitkeep":
+            continue
+        item_path = os.path.join(processing_dir, item)
         try:
-            shutil.rmtree(processing_dir, ignore_errors=True)
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path, ignore_errors=True)
+            else:
+                os.remove(item_path)
         except Exception:
             pass
-    os.makedirs(processing_dir, exist_ok=True)
+    gitkeep_path = os.path.join(processing_dir, ".gitkeep")
+    if not os.path.exists(gitkeep_path):
+        open(gitkeep_path, "a").close()
 
     archive_exts = (".rar", ".zip", ".tar.gz", ".tgz", ".tar", ".tar.bz2", ".7z")
     input_items = os.listdir(input_dir)
@@ -434,8 +494,8 @@ def prepare_processing_folder(input_dir, processing_dir, calibrated_only=False):
         fname = os.path.basename(src_path)
         dst_path = os.path.join(processing_dir, fname)
         shutil.copy2(src_path, dst_path)
-        if idx % 40 == 0 or idx == len(target_bands):
-            print(f"  [OK] Staged {idx}/{len(target_bands)} bands (latest: B{b:03d} -> {fname})")
+        render_progress_bar(idx, len(target_bands), prefix="  Staging", suffix=f"B{b:03d}")
+    print()
 
     if mtl_file:
         dst_mtl = os.path.join(processing_dir, os.path.basename(mtl_file))
@@ -511,20 +571,22 @@ def validate_bands(band_files, target_bands):
         if abs(px_x - 30.0) > 1.0 or abs(px_y - 30.0) > 1.0:
             print(f"  [Notice] Pixel size is ({px_x:.2f}m x {px_y:.2f}m). Standard Hyperion is 30.0m.")
 
-        for b in target_bands:
+        for idx_v, b in enumerate(target_bands, start=1):
             with rasterio.open(band_files[b]) as ds:
                 if ds.width != ref_width or ds.height != ref_height:
-                    print(f"ERROR: Dimension mismatch in B{b:03d} ({ds.width}x{ds.height}) vs ref ({ref_width}x{ref_height}).")
+                    print(f"\nERROR: Dimension mismatch in B{b:03d} ({ds.width}x{ds.height}) vs ref ({ref_width}x{ref_height}).")
                     sys.exit(1)
                 if ds.crs != ref_crs:
-                    print(f"ERROR: CRS mismatch in B{b:03d} ({ds.crs}) vs ref ({ref_crs}).")
+                    print(f"\nERROR: CRS mismatch in B{b:03d} ({ds.crs}) vs ref ({ref_crs}).")
                     sys.exit(1)
                 # Check transform within 1e-5 tolerance
                 for idx_t in range(6):
                     if abs(ds.transform[idx_t] - ref_transform[idx_t]) > 1e-5:
-                        print(f"ERROR: Geotransform mismatch in B{b:03d} at index {idx_t}.")
+                        print(f"\nERROR: Geotransform mismatch in B{b:03d} at index {idx_t}.")
                         print(f"       Expected: {ref_transform}\n       Got:      {ds.transform}")
                         sys.exit(1)
+            render_progress_bar(idx_v, len(target_bands), prefix="  Validating", suffix=f"B{b:03d}")
+        print("\n")
 
         print(f"[OK] Dimensions     : {ref_width} x {ref_height} pixels")
         print(f"[OK] CRS            : {ref_crs}")
@@ -658,110 +720,127 @@ def create_stack(band_files, output_file, ref_info, target_bands, mtl_info=None,
             "blockysize": 256,
             "compress": "lzw",
             "predictor": predictor_val,
-            "bigtiff": "IF_SAFER"
+            "interleave": "band",
+            "bigtiff": "YES"
         }
 
-        with rasterio.open(output_file, "w", **profile) as dst:
-            for out_idx, b_num in enumerate(target_bands, start=1):
-                info = HYPERION_BAND_INFO.get(b_num, {
-                    "wavelength_nm": 0.0,
-                    "fwhm_nm": 10.0,
-                    "spectrometer": "VNIR" if b_num <= 70 else "SWIR",
-                    "scale_factor": vnir_scale if b_num <= 70 else swir_scale,
-                    "is_calibrated": True
-                })
+        with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=512):
+            with rasterio.open(output_file, "w", **profile) as dst:
+                for out_idx, b_num in enumerate(target_bands, start=1):
+                    info = HYPERION_BAND_INFO.get(b_num, {
+                        "wavelength_nm": 0.0,
+                        "fwhm_nm": 10.0,
+                        "spectrometer": "VNIR" if b_num <= 70 else "SWIR",
+                        "scale_factor": vnir_scale if b_num <= 70 else swir_scale,
+                        "is_calibrated": True
+                    })
 
-                with rasterio.open(band_files[b_num]) as src:
-                    data = src.read(1)
+                    with rasterio.open(band_files[b_num]) as src:
+                        data = src.read(1)
 
-                if scale_to_8bit:
-                    valid_mask = data > 0
-                    if np.any(valid_mask):
-                        p2, p98 = np.percentile(data[valid_mask], [2, 98])
-                        scaled = np.clip((data.astype(np.float32) - p2) / max(p98 - p2, 1.0), 0.0, 1.0) * 254.0 + 1.0
-                        scaled[~valid_mask] = 0
-                        out_data = scaled.astype(np.uint8)
+                    if scale_to_8bit:
+                        valid_mask = data > 0
+                        if np.any(valid_mask):
+                            p2, p98 = np.percentile(data[valid_mask], [2, 98])
+                            scaled = np.clip((data.astype(np.float32) - p2) / max(p98 - p2, 1.0), 0.0, 1.0) * 254.0 + 1.0
+                            scaled[~valid_mask] = 0
+                            out_data = scaled.astype(np.uint8)
+                        else:
+                            out_data = np.zeros_like(data, dtype=np.uint8)
                     else:
-                        out_data = np.zeros_like(data, dtype=np.uint8)
-                else:
-                    out_data = data
+                        out_data = data
 
-                dst.write(out_data, out_idx)
+                    dst.write(out_data, out_idx)
 
-                # Set ArcGIS human-readable band name and center wavelength
-                band_desc = f"B{b_num:03d} ({info['wavelength_nm']:.1f}nm)"
-                dst.set_band_description(out_idx, band_desc)
+                    # Set ArcGIS human-readable band name and center wavelength
+                    band_desc = f"B{b_num:03d} ({info['wavelength_nm']:.1f}nm)"
+                    dst.set_band_description(out_idx, band_desc)
 
-                valid = out_data[out_data > 0]
-                if np.any(valid):
-                    b_min = int(np.min(valid))
-                    b_max = int(np.max(valid))
-                    b_mean = float(np.mean(valid))
-                    b_std = float(np.std(valid))
-                    b_median = int(np.median(valid))
+                    valid = out_data[out_data > 0]
+                    if np.any(valid):
+                        b_min = int(np.min(valid))
+                        b_max = int(np.max(valid))
+                        b_mean = float(np.mean(valid))
+                        b_std = float(np.std(valid))
+                        b_median = int(np.median(valid))
 
-                    span = b_max - b_min
-                    if 0 <= span <= 65536 and b_min >= 0:
-                        counts = np.bincount(valid.astype(np.int64))
-                        histo_counts = counts[b_min:b_max + 1]
-                        b_mode = int(b_min + np.argmax(histo_counts))
-                        histo_str = "|".join(map(str, histo_counts))
-                        num_bins = len(histo_counts)
+                        span = b_max - b_min
+                        if 0 <= span <= 65536 and b_min >= 0:
+                            counts = np.bincount(valid.astype(np.int64))
+                            histo_counts = counts[b_min:b_max + 1]
+                            b_mode = int(b_min + np.argmax(histo_counts))
+                            histo_str = "|".join(map(str, histo_counts))
+                            num_bins = len(histo_counts)
+                        else:
+                            num_bins = min(256, max(10, span + 1))
+                            hist, bin_edges = np.histogram(valid, bins=num_bins, range=(b_min, b_max + 1))
+                            b_mode = int(bin_edges[np.argmax(hist)])
+                            histo_str = "|".join(map(str, hist))
                     else:
-                        num_bins = min(256, max(10, span + 1))
-                        hist, bin_edges = np.histogram(valid, bins=num_bins, range=(b_min, b_max + 1))
-                        b_mode = int(bin_edges[np.argmax(hist)])
-                        histo_str = "|".join(map(str, hist))
-                else:
-                    b_min, b_max, b_mean, b_std, b_median, b_mode = 0, 0, 0.0, 0.0, 0, 0
-                    num_bins = 1
-                    histo_str = "0"
+                        b_min, b_max, b_mean, b_std, b_median, b_mode = 0, 0, 0.0, 0.0, 0, 0
+                        num_bins = 1
+                        histo_str = "0"
 
-                scale_factor = vnir_scale if info["spectrometer"] == "VNIR" else swir_scale
+                    scale_factor = vnir_scale if info["spectrometer"] == "VNIR" else swir_scale
+
+                    dst.update_tags(
+                        out_idx,
+                        STATISTICS_MINIMUM=str(b_min),
+                        STATISTICS_MAXIMUM=str(b_max),
+                        STATISTICS_MEAN=f"{b_mean:.8f}",
+                        STATISTICS_STDDEV=f"{b_std:.8f}",
+                        STATISTICS_MEDIAN=str(b_median),
+                        STATISTICS_MODE=str(b_mode),
+                        STATISTICS_HISTONUMBINS=str(num_bins),
+                        STATISTICS_HISTOMIN=str(b_min),
+                        STATISTICS_HISTOMAX=str(b_max),
+                        STATISTICS_EXCLUDEDVALUES="0",
+                        LAYER_TYPE="athematic",
+                        STATISTICS_HISTOBINVALUES=histo_str,
+                        SENSOR="EO-1 Hyperion",
+                        HYPERION_BAND_NUMBER=str(b_num),
+                        BAND_NAME=band_desc,
+                        SPECTROMETER=info["spectrometer"],
+                        WAVELENGTH=f"{info['wavelength_nm']:.2f}",
+                        WAVELENGTH_UNITS="nm",
+                        FWHM=f"{info['fwhm_nm']:.2f} nm",
+                        RADIOMETRIC_SCALE=str(scale_factor),
+                        SCALE_FACTOR=str(scale_factor),
+                        CALIBRATED_STATUS="Calibrated" if info["is_calibrated"] else "Uncalibrated"
+                    )
+
+                    cal_str = "CAL" if info["is_calibrated"] else "ZERO"
+                    render_progress_bar(out_idx, num_bands, prefix="  Stacking", suffix=f"{band_desc} | {info['spectrometer']} | {cal_str}")
+                print()
 
                 dst.update_tags(
-                    out_idx,
-                    STATISTICS_MINIMUM=str(b_min),
-                    STATISTICS_MAXIMUM=str(b_max),
-                    STATISTICS_MEAN=f"{b_mean:.8f}",
-                    STATISTICS_STDDEV=f"{b_std:.8f}",
-                    STATISTICS_MEDIAN=str(b_median),
-                    STATISTICS_MODE=str(b_mode),
-                    STATISTICS_HISTONUMBINS=str(num_bins),
-                    STATISTICS_HISTOMIN=str(b_min),
-                    STATISTICS_HISTOMAX=str(b_max),
-                    STATISTICS_EXCLUDEDVALUES="0",
-                    LAYER_TYPE="athematic",
-                    STATISTICS_HISTOBINVALUES=histo_str,
-                    SENSOR="EO-1 Hyperion",
-                    HYPERION_BAND_NUMBER=str(b_num),
-                    BAND_NAME=band_desc,
-                    SPECTROMETER=info["spectrometer"],
-                    WAVELENGTH=f"{info['wavelength_nm']:.2f}",
-                    WAVELENGTH_UNITS="nm",
-                    FWHM=f"{info['fwhm_nm']:.2f} nm",
-                    RADIOMETRIC_SCALE=str(scale_factor),
-                    SCALE_FACTOR=str(scale_factor),
-                    CALIBRATED_STATUS="Calibrated" if info["is_calibrated"] else "Uncalibrated"
+                    SENSOR="NASA EO-1 Hyperion",
+                    TOTAL_BANDS=str(num_bands),
+                    RADIOMETRIC_UNITS="DN (Radiance W/(m^2*sr*um) = DN / ScaleFactor)",
+                    VNIR_SCALE_FACTOR=str(vnir_scale),
+                    SWIR_SCALE_FACTOR=str(swir_scale),
+                    SPATIAL_RESOLUTION="30.0m",
+                    ACQUISITION_DATE=str(mtl_info.get("ACQUISITION_DATE", "Unknown")) if mtl_info else "Unknown"
                 )
 
-                if out_idx % 25 == 0 or out_idx == num_bands:
-                    cal_str = "CAL" if info["is_calibrated"] else "ZERO"
-                    print(f"  [OK] Stacked Band {out_idx:03d} ({band_desc} | {info['spectrometer']} | {cal_str})")
-
-            dst.update_tags(
-                SENSOR="NASA EO-1 Hyperion",
-                TOTAL_BANDS=str(num_bands),
-                RADIOMETRIC_UNITS="DN (Radiance W/(m^2*sr*um) = DN / ScaleFactor)",
-                VNIR_SCALE_FACTOR=str(vnir_scale),
-                SWIR_SCALE_FACTOR=str(swir_scale),
-                SPATIAL_RESOLUTION="30.0m",
-                ACQUISITION_DATE=str(mtl_info.get("ACQUISITION_DATE", "Unknown")) if mtl_info else "Unknown"
-            )
-
             print("\nBuilding ArcGIS internal overview pyramids [2, 4, 8, 16, 32] (Multi-threaded)...")
-            with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS"):
-                dst.build_overviews([2, 4, 8, 16, 32], Resampling.average)
+            # Run build_overviews in a child process so rasterio's C call doesn't freeze the live timer
+            ovr_code = "\n".join([
+                "import sys, rasterio",
+                "from rasterio.enums import Resampling",
+                "with rasterio.Env(GDAL_NUM_THREADS='ALL_CPUS', GDAL_CACHEMAX=512):",
+                "    with rasterio.open(sys.argv[1], 'r+') as d:",
+                "        d.build_overviews([2, 4, 8, 16, 32], Resampling.average)",
+            ])
+            with SpinnerTimer(f"Building pyramids [2, 4, 8, 16, 32] ({num_bands} bands)"):
+                ovr_res = subprocess.run(
+                    [sys.executable, "-c", ovr_code, output_file],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+            if ovr_res.returncode != 0:
+                print(f"  [WARNING] Overview generation returned code {ovr_res.returncode}: {ovr_res.stderr.strip()}")
 
     else:
         driver = gdal.GetDriverByName("GTiff")
@@ -776,7 +855,8 @@ def create_stack(band_files, output_file, ref_info, target_bands, mtl_info=None,
             "BLOCKYSIZE=256",
             "COMPRESS=LZW",
             f"PREDICTOR={predictor_val}",
-            "BIGTIFF=IF_SAFER"
+            "INTERLEAVE=BAND",
+            "BIGTIFF=YES"
         ]
 
         out_ds = driver.Create(
@@ -891,9 +971,12 @@ def create_stack(band_files, output_file, ref_info, target_bands, mtl_info=None,
         out_ds.SetMetadataItem("SWIR_SCALE_FACTOR", str(swir_scale))
         out_ds.SetMetadataItem("SPATIAL_RESOLUTION", "30.0m")
 
+        ovr_levels = [2, 4, 8, 16, 32]
         print("\nBuilding ArcGIS internal overview pyramids [2, 4, 8, 16, 32] (Multi-threaded)...")
         gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
-        out_ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32])
+        for lvl_idx, lvl in enumerate(ovr_levels, start=1):
+            with SpinnerTimer(f"Pyramid Level {lvl_idx}/{len(ovr_levels)} ({lvl}x downsample, {num_bands} bands)"):
+                out_ds.BuildOverviews("AVERAGE", [lvl])
         out_ds.FlushCache()
         out_ds = None
 
@@ -1107,33 +1190,44 @@ def check_data_integrity(output_file, target_bands):
     if USE_RASTERIO:
         with rasterio.open(output_file) as out_ds:
             for out_idx, b_num in enumerate(target_bands, start=1):
-                data = out_ds.read(out_idx)
-                max_val = np.max(data)
+                tags = out_ds.tags(out_idx)
+                if "STATISTICS_MAXIMUM" in tags:
+                    max_val = float(tags["STATISTICS_MAXIMUM"])
+                else:
+                    max_val = float(np.max(out_ds.read(out_idx)))
                 is_cal = (8 <= b_num <= 57) or (77 <= b_num <= 224)
 
                 if is_cal:
                     if max_val == 0:
-                        print(f"WARNING: Calibrated Band B{b_num:03d} (Stack #{out_idx}) contains all zero values!")
+                        print(f"\nWARNING: Calibrated Band B{b_num:03d} (Stack #{out_idx}) contains all zero values!")
                     else:
                         calibrated_valid += 1
                 else:
                     if max_val == 0:
                         uncalibrated_zero += 1
+                render_progress_bar(out_idx, len(target_bands), prefix="  Integrity", suffix=f"B{b_num:03d}")
+        print()
     else:
         out_ds = gdal.Open(output_file, gdal.GA_ReadOnly)
         for out_idx, b_num in enumerate(target_bands, start=1):
-            data = out_ds.GetRasterBand(out_idx).ReadAsArray()
-            max_val = np.max(data)
+            band = out_ds.GetRasterBand(out_idx)
+            stat_max = band.GetMetadataItem("STATISTICS_MAXIMUM")
+            if stat_max is not None:
+                max_val = float(stat_max)
+            else:
+                max_val = float(np.max(band.ReadAsArray()))
             is_cal = (8 <= b_num <= 57) or (77 <= b_num <= 224)
 
             if is_cal:
                 if max_val == 0:
-                    print(f"WARNING: Calibrated Band B{b_num:03d} (Stack #{out_idx}) contains all zero values!")
+                    print(f"\nWARNING: Calibrated Band B{b_num:03d} (Stack #{out_idx}) contains all zero values!")
                 else:
                     calibrated_valid += 1
             else:
                 if max_val == 0:
                     uncalibrated_zero += 1
+            render_progress_bar(out_idx, len(target_bands), prefix="  Integrity", suffix=f"B{b_num:03d}")
+        print()
         out_ds = None
 
     print(f"[OK] Calibrated Bands with valid radiometry : {calibrated_valid}")

@@ -98,7 +98,6 @@ The **NASA Earth Observing-1 (EO-1) Hyperion** sensor was the first civilian spa
 hyperion stacker/
 │
 ├── Hyperion_Stacker.py            # Main automated pipeline script (ArcGIS Pro output)
-├── Hyperion_ArcGIS_Stacker.py     # Standalone convenience runner for ArcGIS Pro
 ├── compare_hyperion_stacks.py     # Verification & spectral profile comparison tool
 ├── test_hyperion_stacker.py       # Full automated test suite
 ├── README.md                      # Complete documentation & band table
